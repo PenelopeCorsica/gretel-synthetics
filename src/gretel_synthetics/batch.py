@@ -33,7 +33,6 @@ from gretel_synthetics.errors import TooManyInvalidError
 from gretel_synthetics.train import train
 from gretel_synthetics.tokenizers import BaseTokenizerTrainer
 
-from memory_profiler import profile
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
