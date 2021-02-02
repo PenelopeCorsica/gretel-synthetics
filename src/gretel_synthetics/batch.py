@@ -8,6 +8,8 @@ Then we can concat each sub-DF back into one final synthetic dataset.
 For example usage, please see our Jupyter Notebook.
 """
 from dataclasses import dataclass, field
+from collections.abc import Iterator
+import itertools as it
 from pathlib import Path
 import gzip
 from math import ceil
@@ -31,6 +33,7 @@ from gretel_synthetics.errors import TooManyInvalidError
 from gretel_synthetics.train import train
 from gretel_synthetics.tokenizers import BaseTokenizerTrainer
 
+from memory_profiler import profile
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -237,6 +240,72 @@ def _build_batch_dirs(
             fout.write(json.dumps(headers))
 
     return out
+
+
+class LineGenerator(Iterator):
+    """An Iterator class that will generate line-by-line synthetic data
+    """
+
+    def __init__(
+        self, 
+        batcher, 
+        max_invalid, 
+        num_lines, 
+        num_proc):
+        self.batcher = batcher
+        self.seed_fields = None
+        self.max_invalid = max_invalid
+        self.num_lines = num_lines
+        self.num_proc = num_proc
+        self.summary = GenerationSummary()
+        assert self.batcher is not None, "Need to instantiate `batcher`"
+
+    def _per_batch_gen(self, batch_idx) -> List[GenText]:
+        """Per batch line generator
+        """
+        try:
+            batch = self.batcher.batches[batch_idx]
+        except KeyError:  # pragma: no cover
+            raise ValueError("invalid batch index")
+
+        seed_string = None
+
+        # If we are on batch 0 and we have seed values, we want to validate that
+        # the seed values line up properly with the first N columns.
+        if batch_idx == 0 and self.seed_fields is not None:
+            seed_string = self._validate_batch_seed_values(batch, self.seed_fields)
+
+        batch: Batch
+        batch.reset_gen_data()
+        validator = batch.get_validator()
+        line: GenText
+
+        for line in generate_text(
+            batch.config,
+            line_validator=validator, 
+            num_lines=self.num_lines):
+            if line.valid is None or line.valid is True:
+                batch.add_valid_data(line)
+                self.summary.valid_lines += 1
+            else:
+                self.summary.invalid_lines += 1
+                batch.gen_data_invalid.append(line)
+        return batch
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        all_batches = {}
+        for idx in self.batcher.batches.keys():
+            valid_batch = self._per_batch_gen(idx)
+            all_batches[idx] = valid_batch
+        batch_iter = iter(all_batches.values())
+        base_batch = next(batch_iter)
+        accum_df = base_batch.synthetic_df
+        for batch in batch_iter:
+            accum_df = pd.concat([accum_df, batch.synthetic_df], axis=1)
+        yield accum_df[self.batcher.original_headers or self.batcher.master_header_list]
 
 
 class DataFrameBatch:
@@ -515,6 +584,15 @@ class DataFrameBatch:
             return seed_strings[0]
         else:
             return seed_strings
+
+    def create_line_generator(
+        self,
+        max_invalid=MAX_INVALID,
+        num_lines: int = 1,
+        num_proc: int = 0
+        ) -> LineGenerator:
+        generator = LineGenerator(self, max_invalid, num_lines, num_proc)
+        return generator
 
     def generate_batch_lines(
         self,
